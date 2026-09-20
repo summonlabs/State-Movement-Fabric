@@ -1,0 +1,46 @@
+# Build trees
+build/
+build-*/
+out/
+install/
+_deps/
+
+# CMake-generated files that can escape a build tree
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+
+# Visual Studio generator output
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Compiler and linker intermediates
+*.obj
+*.o
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Editor and OS noise
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*~
+
+# Runtime artifacts produced by exercising the fabric
+*.log
+*.tmp
+runtime/
+smf-runtime/
