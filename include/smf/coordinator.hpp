@@ -64,7 +64,11 @@ struct CoordinatorCounters {
   std::uint64_t movements_submitted = 0;
   std::uint64_t movements_rejected = 0;
   std::uint64_t movements_committed = 0;
+  // Terminal failures: a movement that ended in FAILED.
   std::uint64_t movements_failed = 0;
+  // Attempts that failed and were retried. These are not failed movements, and
+  // keeping them separate is what makes the two numbers add up.
+  std::uint64_t attempts_failed = 0;
   std::uint64_t movements_cancelled = 0;
   std::uint64_t movements_superseded = 0;
   std::uint64_t outcomes_unknown = 0;

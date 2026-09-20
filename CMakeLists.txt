@@ -10,7 +10,7 @@
 cmake_minimum_required(VERSION 3.20...3.28)
 
 project(StateMovementFabric
-  VERSION 1.0.1
+  VERSION 1.0.2
   DESCRIPTION "Vendor-neutral C++20 runtime for governing cross-network movement of reusable AI state"
   HOMEPAGE_URL "https://github.com/summonlabs/State-Movement-Fabric"
   LANGUAGES CXX)

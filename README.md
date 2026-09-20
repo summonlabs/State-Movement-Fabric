@@ -1,6 +1,6 @@
 # State Movement Fabric
 
-**State Movement Fabric (SMF) 1.0.1** is an open-source, vendor-neutral C++20 runtime for
+**State Movement Fabric (SMF) 1.0.2** is an open-source, vendor-neutral C++20 runtime for
 governing the cross-network movement of reusable AI state: model weights, adapters, tensors,
 KV caches, prefix caches, checkpoints, derived artifacts, and opaque blobs.
 

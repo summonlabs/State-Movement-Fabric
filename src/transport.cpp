@@ -297,16 +297,19 @@ std::string SocketAddress::to_string() const {
 }
 
 struct TcpConnection::State {
-  NativeSocket socket = kInvalidNativeSocket;
+  // Whichever thread is blocked in send or receive reads this handle while
+  // another thread may be storing to it from shutdown() or close(), so the
+  // handle itself is atomic. The descriptor is closed exactly once, when the
+  // last reference releases it, so a blocked reader is never holding a handle
+  // that was already returned to the operating system.
+  std::atomic<NativeSocket> socket{kInvalidNativeSocket};
   std::atomic<bool> closed{false};
   std::mutex mutex;
 
   ~State() {
     std::lock_guard<std::mutex> lock(mutex);
-    if (socket != kInvalidNativeSocket) {
-      close_native(socket);
-      socket = kInvalidNativeSocket;
-    }
+    const NativeSocket handle = socket.exchange(kInvalidNativeSocket);
+    if (handle != kInvalidNativeSocket) close_native(handle);
   }
 };
 
@@ -328,7 +331,7 @@ TcpConnection& TcpConnection::operator=(TcpConnection&& other) noexcept {
 
 bool TcpConnection::is_open() const noexcept {
   return state_ != nullptr && !state_->closed.load(std::memory_order_acquire) &&
-         state_->socket != kInvalidNativeSocket;
+         state_->socket.load() != kInvalidNativeSocket;
 }
 
 Result<TcpConnection> TcpConnection::connect(const SocketAddress& address, Millis budget_millis) {
@@ -401,7 +404,7 @@ Result<TcpConnection> TcpConnection::connect(const SocketAddress& address, Milli
 
   TcpConnection connection;
   connection.state_ = std::make_shared<State>();
-  connection.state_->socket = socket;
+  connection.state_->socket.store(socket);
   set_option(socket, IPPROTO_TCP, TCP_NODELAY, 1);
 
   sockaddr_storage local{};
@@ -424,13 +427,13 @@ Result<TcpConnection> TcpConnection::adopt(void* native_handle, SocketAddress pe
   TcpConnection connection;
   connection.state_ = std::make_shared<State>();
 #if defined(_WIN32)
-  connection.state_->socket = reinterpret_cast<NativeSocket>(native_handle);
+  connection.state_->socket.store(reinterpret_cast<NativeSocket>(native_handle));
 #else
-  connection.state_->socket = static_cast<NativeSocket>(reinterpret_cast<std::intptr_t>(native_handle));
+  connection.state_->socket.store(static_cast<NativeSocket>(reinterpret_cast<std::intptr_t>(native_handle)));
 #endif
   connection.peer_ = std::move(peer);
-  set_non_blocking(connection.state_->socket);
-  set_option(connection.state_->socket, IPPROTO_TCP, TCP_NODELAY, 1);
+  set_non_blocking(connection.state_->socket.load());
+  set_option(connection.state_->socket.load(), IPPROTO_TCP, TCP_NODELAY, 1);
   return connection;
 }
 
@@ -447,10 +450,10 @@ Status TcpConnection::send_all(ByteView data, Millis budget_millis) {
     const std::size_t remaining = data.size() - offset;
     const int chunk = static_cast<int>(std::min<std::size_t>(remaining, 1U << 20));
 #if defined(_WIN32)
-    const int written = ::send(state_->socket, reinterpret_cast<const char*>(data.data() + offset),
+    const int written = ::send(state_->socket.load(), reinterpret_cast<const char*>(data.data() + offset),
                                chunk, 0);
 #else
-    const ssize_t written = ::send(state_->socket, data.data() + offset, static_cast<std::size_t>(chunk),
+    const ssize_t written = ::send(state_->socket.load(), data.data() + offset, static_cast<std::size_t>(chunk),
                                    MSG_NOSIGNAL);
 #endif
     if (written > 0) {
@@ -471,7 +474,7 @@ Status TcpConnection::send_all(ByteView data, Millis budget_millis) {
       return Status(ReasonCode::IO_TIMEOUT, "send timed out");
     }
     const int slice = static_cast<int>(std::min<Millis>(left, 50));
-    const int ready = poll_socket(state_->socket, false, slice);
+    const int ready = poll_socket(state_->socket.load(), false, slice);
     if (ready < 0) {
       if (state_->closed.load(std::memory_order_acquire)) {
         return Status(ReasonCode::CONNECTION_CLOSED, "connection was shut down locally");
@@ -495,9 +498,9 @@ Result<std::size_t> TcpConnection::receive_some(ByteSpan buffer, Millis budget_m
     }
     const int chunk = static_cast<int>(std::min<std::size_t>(buffer.size(), 1U << 20));
 #if defined(_WIN32)
-    const int received = ::recv(state_->socket, reinterpret_cast<char*>(buffer.data()), chunk, 0);
+    const int received = ::recv(state_->socket.load(), reinterpret_cast<char*>(buffer.data()), chunk, 0);
 #else
-    const ssize_t received = ::recv(state_->socket, buffer.data(), static_cast<std::size_t>(chunk), 0);
+    const ssize_t received = ::recv(state_->socket.load(), buffer.data(), static_cast<std::size_t>(chunk), 0);
 #endif
     if (received > 0) return static_cast<std::size_t>(received);
     if (received == 0) return std::size_t{0};  // orderly close by the peer
@@ -512,7 +515,7 @@ Result<std::size_t> TcpConnection::receive_some(ByteSpan buffer, Millis budget_m
       return Status(ReasonCode::IO_TIMEOUT, "receive timed out");
     }
     const int slice = static_cast<int>(std::min<Millis>(left, 50));
-    const int ready = poll_socket(state_->socket, true, slice);
+    const int ready = poll_socket(state_->socket.load(), true, slice);
     if (ready < 0) {
       if (state_->closed.load(std::memory_order_acquire)) {
         return Status(ReasonCode::CONNECTION_CLOSED, "connection was shut down locally");
@@ -528,13 +531,13 @@ Status TcpConnection::shutdown() {
   }
   std::lock_guard<std::mutex> lock(state_->mutex);
   state_->closed.store(true, std::memory_order_release);
-  if (state_->socket == kInvalidNativeSocket) {
+  if (state_->socket.load() == kInvalidNativeSocket) {
     return Status(ReasonCode::CONNECTION_CLOSED, "connection is already closed");
   }
 #if defined(_WIN32)
-  (void)::shutdown(state_->socket, SD_BOTH);
+  (void)::shutdown(state_->socket.load(), SD_BOTH);
 #else
-  (void)::shutdown(state_->socket, SHUT_RDWR);
+  (void)::shutdown(state_->socket.load(), SHUT_RDWR);
 #endif
   return Status::success();
 }
@@ -542,26 +545,26 @@ Status TcpConnection::shutdown() {
 void TcpConnection::close() noexcept { state_.reset(); }
 
 void TcpConnection::set_no_delay(bool enabled) noexcept {
-  if (state_ == nullptr || state_->socket == kInvalidNativeSocket) return;
-  set_option(state_->socket, IPPROTO_TCP, TCP_NODELAY, enabled ? 1 : 0);
+  if (state_ == nullptr || state_->socket.load() == kInvalidNativeSocket) return;
+  set_option(state_->socket.load(), IPPROTO_TCP, TCP_NODELAY, enabled ? 1 : 0);
 }
 
 void TcpConnection::set_keep_alive(bool enabled) noexcept {
-  if (state_ == nullptr || state_->socket == kInvalidNativeSocket) return;
-  set_option(state_->socket, SOL_SOCKET, SO_KEEPALIVE, enabled ? 1 : 0);
+  if (state_ == nullptr || state_->socket.load() == kInvalidNativeSocket) return;
+  set_option(state_->socket.load(), SOL_SOCKET, SO_KEEPALIVE, enabled ? 1 : 0);
 }
 
 struct TcpListener::State {
-  NativeSocket socket = kInvalidNativeSocket;
+  // accept() runs on one thread while close() may run on another, so the handle
+  // is atomic and the descriptor is closed exactly once.
+  std::atomic<NativeSocket> socket{kInvalidNativeSocket};
   std::atomic<bool> closed{false};
   std::mutex mutex;
 
   ~State() {
     std::lock_guard<std::mutex> lock(mutex);
-    if (socket != kInvalidNativeSocket) {
-      close_native(socket);
-      socket = kInvalidNativeSocket;
-    }
+    const NativeSocket handle = socket.exchange(kInvalidNativeSocket);
+    if (handle != kInvalidNativeSocket) close_native(handle);
   }
 };
 
@@ -607,7 +610,7 @@ Result<TcpListener> TcpListener::bind(const SocketAddress& address) {
 
   TcpListener listener;
   listener.state_ = std::make_shared<State>();
-  listener.state_->socket = socket;
+  listener.state_->socket.store(socket);
 
   sockaddr_storage bound{};
 #if defined(_WIN32)
@@ -640,7 +643,7 @@ Result<TcpConnection> TcpListener::accept(Millis budget_millis) {
     socklen_t peer_length = sizeof(peer);
 #endif
     const NativeSocket accepted =
-        ::accept(state_->socket, reinterpret_cast<sockaddr*>(&peer), &peer_length);
+        ::accept(state_->socket.load(), reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (accepted != kInvalidNativeSocket) {
       // adopt() performs the non-blocking and TCP_NODELAY configuration and
       // owns the descriptor from here on.
@@ -674,7 +677,7 @@ Result<TcpConnection> TcpListener::accept(Millis budget_millis) {
     }
     // Short slices so that close() from another thread is observed promptly.
     const int slice = static_cast<int>(std::min<Millis>(left, 50));
-    const int ready = poll_socket(state_->socket, true, slice);
+    const int ready = poll_socket(state_->socket.load(), true, slice);
     if (ready < 0) {
       // Closing the descriptor underneath a blocked accept surfaces here as a
       // poll failure; the local shutdown is the real cause.
@@ -692,22 +695,22 @@ Status TcpListener::close() {
   }
   std::lock_guard<std::mutex> lock(state_->mutex);
   state_->closed.store(true, std::memory_order_release);
-  if (state_->socket == kInvalidNativeSocket) {
+  if (state_->socket.load() == kInvalidNativeSocket) {
     return Status(ReasonCode::SHUTTING_DOWN, "listener is already closed");
   }
 #if defined(_WIN32)
-  (void)::shutdown(state_->socket, SD_BOTH);
+  (void)::shutdown(state_->socket.load(), SD_BOTH);
 #else
-  (void)::shutdown(state_->socket, SHUT_RDWR);
+  (void)::shutdown(state_->socket.load(), SHUT_RDWR);
 #endif
-  close_native(state_->socket);
-  state_->socket = kInvalidNativeSocket;
+  close_native(state_->socket.load());
+  state_->socket.store(kInvalidNativeSocket);
   return Status::success();
 }
 
 bool TcpListener::is_open() const noexcept {
   return state_ != nullptr && !state_->closed.load(std::memory_order_acquire) &&
-         state_->socket != kInvalidNativeSocket;
+         state_->socket.load() != kInvalidNativeSocket;
 }
 
 ReasonCode last_socket_error_code() noexcept { return classify_socket_error(); }

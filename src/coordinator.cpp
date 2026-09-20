@@ -1368,7 +1368,7 @@ Status Coordinator::drive_movement(const MovementId& id) {
         return fail(result.code, "the last permitted attempt failed: " + result.detail,
                     MovementState::FAILED);
       }
-      count([](CoordinatorCounters& c) { c.movements_failed += 1; });
+      count([](CoordinatorCounters& c) { c.attempts_failed += 1; });
       (void)record.provenance.append(ProvenanceEventKind::RETRY_SCHEDULED, record.state,
                                      record.generation, result.code, system_clock().unix_millis(),
                                      "retrying after: " + result.detail);
@@ -1406,7 +1406,7 @@ Status Coordinator::drive_movement(const MovementId& id) {
       (void)noted;
       const Status saved_retry = store_->put(record);
       (void)saved_retry;
-      count([](CoordinatorCounters& c) { c.movements_failed += 1; });
+      count([](CoordinatorCounters& c) { c.attempts_failed += 1; });
       continue;
     }
 
