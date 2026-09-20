@@ -639,11 +639,33 @@ void EndpointAgent::control_reader_loop() {
       }
       // Release every worker that is waiting on an answer that can no longer
       // arrive, so shutdown never leaves a thread blocked.
-      std::lock_guard<std::mutex> lock(control_->pending_mutex);
-      for (auto& entry : control_->pending) {
-        if (entry.second) entry.second->set_value(Frame{});
+      {
+        std::lock_guard<std::mutex> lock(control_->pending_mutex);
+        for (auto& entry : control_->pending) {
+          if (entry.second) entry.second->set_value(Frame{});
+        }
+        control_->pending.clear();
       }
-      control_->pending.clear();
+
+      // The coordinator link is gone, so every grant it issued and every
+      // cancellation it sent dies with the session that carried it. A grant is
+      // authority delegated by a specific coordinator incarnation; keeping one
+      // after that session ends would let a stale token be presented later.
+      std::size_t dropped_grants = 0;
+      {
+        std::lock_guard<std::mutex> lock(grants_mutex_);
+        dropped_grants = grants_.size();
+        grants_.clear();
+      }
+      {
+        std::lock_guard<std::mutex> lock(cancels_mutex_);
+        cancellations_.clear();
+      }
+      if (dropped_grants > 0) {
+        log_message(LogLevel::INFO, "endpoint",
+                    "dropped " + std::to_string(dropped_grants) +
+                        " transfer grant(s) with the coordinator session");
+      }
       break;
     }
 
@@ -1163,16 +1185,56 @@ Status EndpointAgent::publish_file(StateKind kind, std::string name, StateGenera
   if (error) return Status(ReasonCode::STORE_IO_ERROR, "could not create the object directory");
 
   const std::filesystem::path temporary = directory / "data.import";
-  {
-    std::filesystem::copy_file(source_file, temporary,
-                               std::filesystem::copy_options::overwrite_existing, error);
-    if (error) return Status(ReasonCode::STORE_IO_ERROR, "could not copy the object into the store");
-    SMF_RETURN_IF_ERROR(sync_existing_file(temporary));
-    const std::filesystem::path target = store_->object_data_path(value.object_id, generation);
-    std::filesystem::remove(target, error);
-    std::filesystem::rename(temporary, target, error);
-    if (error) return Status(ReasonCode::STORE_IO_ERROR, "could not place the object bytes");
+  std::filesystem::copy_file(source_file, temporary,
+                             std::filesystem::copy_options::overwrite_existing, error);
+  if (error) return Status(ReasonCode::STORE_IO_ERROR, "could not copy the object into the store");
+  return finalize_publication(value, temporary);
+}
+
+Status EndpointAgent::publish_bytes(StateKind kind, std::string name, StateGeneration generation,
+                                    ByteView contents, const std::string& producer, bool repeatable,
+                                    StateObjectDescriptor* descriptor_out) {
+  if (contents.size() > config_.policy.max_object_bytes) {
+    return Status(ReasonCode::POLICY_VIOLATION, "the payload exceeds the configured object bound");
   }
+
+  const std::uint64_t preferred_chunk = 1ULL << 20;
+  const std::uint64_t chunk_bytes =
+      std::min<std::uint64_t>(config_.policy.max_chunk_bytes,
+                              std::max<std::uint64_t>(config_.policy.min_chunk_bytes,
+                                                      preferred_chunk));
+
+  const Digest content = sha256(contents);
+  const auto descriptor = StateObjectDescriptor::create(
+      kind, std::move(name), generation, content, contents.size(), chunk_bytes,
+      system_clock().unix_millis(), producer);
+  if (!descriptor.ok()) return descriptor.status();
+
+  StateObjectDescriptor value = descriptor.value();
+  value.repeatable = repeatable;
+
+  const std::filesystem::path directory = store_->object_directory(value.object_id, generation);
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error) return Status(ReasonCode::STORE_IO_ERROR, "could not create the object directory");
+
+  const std::filesystem::path temporary = directory / "data.import";
+  SMF_RETURN_IF_ERROR(atomic_replace_file(temporary, contents, true));
+  SMF_RETURN_IF_ERROR(finalize_publication(value, temporary));
+  if (descriptor_out != nullptr) *descriptor_out = value;
+  return Status::success();
+}
+
+Status EndpointAgent::finalize_publication(const StateObjectDescriptor& value,
+                                           const std::filesystem::path& staged) {
+  std::error_code error;
+  SMF_RETURN_IF_ERROR(sync_existing_file(staged));
+
+  const std::filesystem::path target =
+      store_->object_data_path(value.object_id, value.generation);
+  std::filesystem::remove(target, error);
+  std::filesystem::rename(staged, target, error);
+  if (error) return Status(ReasonCode::STORE_IO_ERROR, "could not place the object bytes");
 
   IdIssuer issuer;
   const auto origin = EndpointId::parse(kLocalOrigin);
@@ -1186,8 +1248,8 @@ Status EndpointAgent::publish_file(StateKind kind, std::string name, StateGenera
   marker.destination = config_.endpoint_id;
   marker.destination_incarnation = DestinationIncarnation::make(
       config_.endpoint_id, incarnation_.boot(), incarnation_.epoch()).value();
-  marker.content_digest = content;
-  marker.stored_bytes = size.value();
+  marker.content_digest = value.content_digest;
+  marker.stored_bytes = value.total_bytes;
   marker.stored_chunks = value.chunk_count;
   marker.committed_unix_millis = system_clock().unix_millis();
   marker.seal();
@@ -1202,11 +1264,55 @@ Status EndpointAgent::publish_file(StateKind kind, std::string name, StateGenera
 }
 
 Status EndpointAgent::announce(const StateObjectDescriptor& descriptor) {
+  // Publication is only meaningful once the coordinator has accepted the
+  // announcement, so this is a request and a wait rather than a fire-and-forget
+  // send. A caller that sees success knows the inventory holds this version.
+  if (control_ == nullptr || !control_->alive.load(std::memory_order_acquire)) {
+    return Status(ReasonCode::CONNECTION_CLOSED, "the coordinator link is not available");
+  }
+
   AnnounceObject message;
   message.descriptor = descriptor;
   CanonicalEncoder encoder;
   message.encode(encoder);
-  return send_control(MessageType::ANNOUNCE_OBJECT, encoder);
+
+  const std::string key = std::string(to_string(MessageType::ANNOUNCE_ACK));
+  auto promise = std::make_shared<std::promise<Frame>>();
+  auto future = promise->get_future();
+  {
+    std::lock_guard<std::mutex> lock(control_->pending_mutex);
+    if (control_->pending.count(key) != 0) {
+      return Status(ReasonCode::BUSY, "another announcement is already in flight");
+    }
+    control_->pending.emplace(key, promise);
+  }
+
+  const Status sent = send_control(MessageType::ANNOUNCE_OBJECT, encoder);
+  if (!sent.ok()) {
+    std::lock_guard<std::mutex> lock(control_->pending_mutex);
+    control_->pending.erase(key);
+    return sent;
+  }
+
+  if (future.wait_for(std::chrono::milliseconds(config_.io_budget_millis)) !=
+      std::future_status::ready) {
+    std::lock_guard<std::mutex> lock(control_->pending_mutex);
+    control_->pending.erase(key);
+    return Status(ReasonCode::IO_TIMEOUT,
+                  "the coordinator did not acknowledge the announcement");
+  }
+
+  const Frame frame = future.get();
+  if (frame.header.type != MessageType::ANNOUNCE_ACK) {
+    return Status(ReasonCode::CONNECTION_CLOSED,
+                  "the coordinator link closed before the acknowledgement arrived");
+  }
+  const auto ack = decode_message<AnnounceAck>(frame);
+  if (!ack.ok()) return ack.status();
+  if (ack.value().code != ReasonCode::OK) {
+    return Status(ack.value().code, ack.value().detail);
+  }
+  return Status::success();
 }
 
 // ---------------------------------------------------------------------------

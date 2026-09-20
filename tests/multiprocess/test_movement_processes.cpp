@@ -203,7 +203,9 @@ class Fabric {
     }
     ChildProcess child = start_process(spec, id.c_str());
     if (publish) {
-      wait_for_log(child, "published", "source endpoint");
+      // Wait for the announcement the coordinator actually accepted, not for
+      // the local placement that precedes it.
+      wait_for_log(child, "announced", "source endpoint");
     } else {
       wait_for_log(child, "registered with topology generation", "destination endpoint");
     }
@@ -498,4 +500,20 @@ SMF_TEST(multiprocess, coordinator_restart_is_conservative) {
 
   // The restarted coordinator advances its incarnation epoch.
   SMF_CHECK(report.value().coordinator.epoch().value() >= 2);
+
+  // Nothing movable survives the restart. The inventory of announced versions
+  // is dynamic evidence and is deliberately not restored, so the same
+  // submission that was accepted before the restart is now refused. Neither the
+  // old grants nor the old registrations carried across.
+  smf::SubmitMovement resubmit;
+  resubmit.object_id =
+      smf::derive_state_object_id(smf::StateKind::GENERIC_BLOB, "demo/state").value();
+  resubmit.object_generation = smf::StateGeneration(1);
+  resubmit.source = smf::EndpointId::parse("source-1").value();
+  resubmit.destination = smf::EndpointId::parse("dest-1").value();
+  const auto refused =
+      restarted.call<smf::SubmitMovement, smf::MovementAccepted>(resubmit);
+  SMF_CHECK(!refused.ok());
+  SMF_CHECK(refused.status().code() == smf::ReasonCode::OBJECT_NOT_FOUND ||
+            refused.status().code() == smf::ReasonCode::ENDPOINT_NOT_LIVE);
 }

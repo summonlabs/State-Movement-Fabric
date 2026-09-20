@@ -224,10 +224,13 @@ Result<FrameHeader> decode_frame_header(ByteView in, std::uint32_t max_payload_b
   if (header.sequence == 0) {
     return Status(ReasonCode::PROTOCOL_CANONICAL_VIOLATION, "frame sequence numbers start at one");
   }
-  if (!Digest::from_bytes(ByteView(in.data() + 24, Digest::kBytes)).ok()) {
-    return Status(ReasonCode::PROTOCOL_MALFORMED, "frame authentication tag is malformed");
-  }
-  header.auth_tag = Digest::from_bytes(ByteView(in.data() + 24, Digest::kBytes)).value();
+  // The wire tag is exactly kFrameAuthTagBytes wide. It is held in a 32-byte
+  // Digest so that it travels through the same constant-time comparison as a
+  // full tag, so the read must be the tag width and the remainder must stay
+  // zero. Reading a full digest here would run past the fixed-size header.
+  std::array<Byte, Digest::kBytes> tag{};
+  std::memcpy(tag.data(), in.data() + 24, kFrameAuthTagBytes);
+  header.auth_tag = Digest(tag);
   return header;
 }
 

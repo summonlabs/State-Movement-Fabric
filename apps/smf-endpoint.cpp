@@ -8,6 +8,8 @@
 #include <string>
 
 #include "args.hpp"
+#include "smf-endpoint-cuda.hpp"
+#include "smf/logging.hpp"
 #include "smf/endpoint_agent.hpp"
 #include "smf/fault_injection.hpp"
 #include "smf/logging.hpp"
@@ -23,6 +25,7 @@ constexpr const char* kUsage =
     "  --key <hex>              32-byte shared secret as 64 hex characters\n"
     "  --data <host:port>       data listener (default 127.0.0.1:0)\n"
     "  --publish <spec>         publish a file: kind:name:generation:path\n"
+    "  --publish-cuda <spec>    publish device memory: kind:name:generation:bytes:seed\n"
     "  --no-resume              refuse to resume a partially received object\n"
     "  --log-level <level>      TRACE, DEBUG, INFO, WARN, ERROR, OFF\n"
     "  --fault-inject <spec>    enable documented fault injection points\n"
@@ -70,6 +73,11 @@ constexpr const char* kUsage =
   const auto marker = store.read_commit_marker(object_id.value(), smf::StateGeneration(generation));
   if (!marker.ok()) return marker.status();
   SMF_RETURN_IF_ERROR(agent.announce(marker.value().object));
+  // "Announced" is a stronger statement than "published": it means the
+  // coordinator accepted this version into its inventory, which is what a
+  // movement submission depends on.
+  smf::log_message(smf::LogLevel::INFO, "endpoint",
+                   "announced " + smf::describe(marker.value().object));
   return marker.value().object;
 }
 
@@ -154,6 +162,15 @@ int main(int argc, char** argv) {
   if (!connected.ok()) {
     std::fprintf(stderr, "registration failed: %s\n", connected.to_string().c_str());
     return 1;
+  }
+
+  const std::string publish_cuda = args.get("publish-cuda");
+  if (!publish_cuda.empty()) {
+    const smf::Status published = smf::app::publish_cuda_spec(publish_cuda, *agent, true);
+    if (!published.ok()) {
+      std::fprintf(stderr, "device publication failed: %s\n", published.to_string().c_str());
+      return 1;
+    }
   }
 
   const std::string publish = args.get("publish");

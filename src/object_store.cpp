@@ -922,7 +922,12 @@ Result<ResumeState> StagingWriter::append(std::uint32_t index, std::uint64_t off
   journal_.verified_chunks += 1;
   accumulate(journal_.verified_bytes, expected_length.value());
 
-  if (journaling_ && store_->options().sync_on_write) {
+  // The journal is written after every accepted chunk, independently of whether
+  // the store is configured to flush to the device. Durability is what
+  // sync_on_write governs; the journal is what makes an interrupted attempt
+  // resumable at all, and a retry within the same process must not have to
+  // re-transfer a prefix that was already verified.
+  if (journaling_) {
     SMF_RETURN_IF_ERROR(store_->save_journal(journal_));
   }
 

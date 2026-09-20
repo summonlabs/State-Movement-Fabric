@@ -106,6 +106,10 @@ class Coordinator {
   [[nodiscard]] PolicyReport policy_report() const;
 
   [[nodiscard]] CoordinatorCounters counters() const;
+
+  // Direct store access. It is only valid while the coordinator is running:
+  // stop() releases the store so that the state directory can be handed to a
+  // new instance immediately.
   [[nodiscard]] MovementStore& store() noexcept { return *store_; }
 
   // Test seam: block until no movement is actively being worked on.
@@ -127,6 +131,7 @@ class Coordinator {
   };
 
   [[nodiscard]] Status open_store();
+  [[nodiscard]] Status require_running() const;
   void recover_after_restart();
   void accept_loop(bool admin);
   [[nodiscard]] Status session_loop(TcpConnection connection, bool admin);

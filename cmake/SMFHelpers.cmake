@@ -13,16 +13,22 @@ function(smf_apply_target_defaults target)
   target_compile_features(${target} PUBLIC cxx_std_20)
 
   if(MSVC)
+    # These options are host-compiler options. They are attached per language so
+    # that a CUDA translation unit in the same target never receives them raw:
+    # nvcc forwards unknown flags to the host compiler only through -Xcompiler.
     target_compile_options(${target} PRIVATE
-      /W4
-      /permissive-
-      /Zc:__cplusplus
-      /Zc:preprocessor
-      /Zc:ternary
-      /utf-8
-      /EHsc)
+      $<$<COMPILE_LANGUAGE:CXX>:/W4>
+      $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+      $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+      $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+      $<$<COMPILE_LANGUAGE:CXX>:/Zc:ternary>
+      $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+      $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/permissive->
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
     if(SMF_WARNINGS_AS_ERRORS)
-      target_compile_options(${target} PRIVATE /WX)
+      target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/WX>)
     endif()
     target_compile_definitions(${target} PRIVATE
       _CRT_SECURE_NO_WARNINGS
@@ -52,7 +58,14 @@ function(smf_apply_target_defaults target)
 
   if(SMF_SANITIZE STREQUAL "address")
     if(MSVC)
-      target_compile_options(${target} PRIVATE /fsanitize=address)
+      # The sanitizer needs debug information to attribute a report to a source
+      # location, and the linker needs a matching program database.
+      target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/fsanitize=address>
+        $<$<COMPILE_LANGUAGE:CXX>:/Zi>
+        $<$<COMPILE_LANGUAGE:CXX>:/Od>)
+      # /DEBUG gives the sanitizer a line table to attribute a report to.
+      target_link_options(${target} PRIVATE /INCREMENTAL:NO /DEBUG)
     else()
       target_compile_options(${target} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
       target_link_options(${target} PRIVATE -fsanitize=address)

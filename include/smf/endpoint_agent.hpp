@@ -109,6 +109,14 @@ class EndpointAgent {
                                     const std::filesystem::path& source_file,
                                     const std::string& producer, bool repeatable);
 
+  // Publishes bytes that are already in host memory. This is the entry point for
+  // state that was produced somewhere else entirely, such as a device-memory
+  // buffer that has just been copied to the host.
+  [[nodiscard]] Status publish_bytes(StateKind kind, std::string name, StateGeneration generation,
+                                     ByteView contents, const std::string& producer,
+                                     bool repeatable,
+                                     StateObjectDescriptor* descriptor_out = nullptr);
+
   [[nodiscard]] Status announce(const StateObjectDescriptor& descriptor);
 
   [[nodiscard]] EndpointCounters counters() const;
@@ -128,6 +136,10 @@ class EndpointAgent {
   };
 
   [[nodiscard]] Status open_store();
+  // Places an already verified staged file as the object version and records the
+  // local commit marker. Shared by every publication path.
+  [[nodiscard]] Status finalize_publication(const StateObjectDescriptor& value,
+                                            const std::filesystem::path& staged);
   [[nodiscard]] Status start_data_listener();
   void accept_loop();
   void session_worker_loop();

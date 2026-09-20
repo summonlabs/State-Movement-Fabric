@@ -624,6 +624,23 @@ Status Coordinator::handle_endpoint_message(const std::shared_ptr<ControlLink>& 
       return Status::success();
     }
 
+    // A response that no longer has a waiter is a late or duplicate completion
+    // of an exchange that has already been resolved. It is recorded and
+    // dropped; it is never re-applied and never treated as a violation.
+    case MessageType::ATTEMPT_RESULT:
+    case MessageType::COMMIT_RESULT:
+    case MessageType::VERIFY_RESPONSE:
+    case MessageType::AUTHORITY_REPORT:
+    case MessageType::CLEANUP_RESULT:
+    case MessageType::CANCEL_ACK:
+    case MessageType::GRANT_ACK: {
+      count([](CoordinatorCounters& c) { c.stale_rejections += 1; });
+      log_message(LogLevel::DEBUG, "coordinator",
+                  "dropped an unclaimed " + std::string(to_string(frame.header.type)) + " from " +
+                      link->endpoint.value());
+      return Status::success();
+    }
+
     default:
       return Status(ReasonCode::PROTOCOL_UNKNOWN_MESSAGE,
                     std::string("the coordinator does not accept ") + to_string(frame.header.type) +
@@ -768,7 +785,16 @@ Status Coordinator::handle_admin_message(const std::shared_ptr<ControlLink>& lin
 // Authoritative operations
 // ---------------------------------------------------------------------------
 
+Status Coordinator::require_running() const {
+  if (store_ == nullptr) {
+    return Status(ReasonCode::SHUTTING_DOWN,
+                  "the coordinator has been stopped and no longer owns its state");
+  }
+  return Status::success();
+}
+
 Result<MovementAccepted> Coordinator::submit(const SubmitMovement& request) {
+  SMF_RETURN_IF_ERROR(require_running());
   const Status valid = request.validate();
   if (!valid.ok()) return valid;
 
@@ -904,10 +930,14 @@ Result<MovementAccepted> Coordinator::submit(const SubmitMovement& request) {
   return accepted;
 }
 
-Result<MovementRecord> Coordinator::query(const MovementId& id) const { return store_->get(id); }
+Result<MovementRecord> Coordinator::query(const MovementId& id) const {
+  SMF_RETURN_IF_ERROR(require_running());
+  return store_->get(id);
+}
 
 Result<std::vector<MovementSummary>> Coordinator::list(std::uint32_t limit,
                                                        std::uint32_t offset) const {
+  SMF_RETURN_IF_ERROR(require_running());
   const std::uint32_t bounded = std::min<std::uint32_t>(limit, 256U);
   const auto records = store_->list(bounded, offset);
   if (!records.ok()) return records.status();
@@ -934,6 +964,7 @@ MovementSummary Coordinator::to_summary(const MovementRecord& record) const {
 }
 
 Result<MovementRecord> Coordinator::cancel(const MovementId& id) {
+  SMF_RETURN_IF_ERROR(require_running());
   auto stored = store_->get(id);
   if (!stored.ok()) return stored.status();
   MovementRecord record = stored.value();
@@ -970,6 +1001,7 @@ Result<MovementRecord> Coordinator::cancel(const MovementId& id) {
 }
 
 Result<MovementRecord> Coordinator::reconcile(const MovementId& id) {
+  SMF_RETURN_IF_ERROR(require_running());
   auto stored = store_->get(id);
   if (!stored.ok()) return stored.status();
   MovementRecord record = stored.value();
@@ -1059,6 +1091,7 @@ Result<MovementRecord> Coordinator::reconcile(const MovementId& id) {
 }
 
 Result<ProvenanceReport> Coordinator::provenance(const MovementId& id) const {
+  SMF_RETURN_IF_ERROR(require_running());
   const auto stored = store_->get(id);
   if (!stored.ok()) return stored.status();
   ProvenanceReport report;
@@ -1285,34 +1318,60 @@ Status Coordinator::drive_movement(const MovementId& id) {
     }
     SMF_RETURN_IF_ERROR(store_->put(record));
 
-    const auto answer = await(destination_link.value(), result_key, result_future, "the attempt result");
-    if (!answer.ok()) {
-      return fail(answer.status().code(),
-                  "the destination never reported an outcome: " + answer.status().message(),
-                  MovementState::OUTCOME_UNKNOWN);
-    }
-    const auto result = decode_message<AttemptResult>(answer.value());
-    if (!result.ok()) {
-      return fail(result.status().code(), result.status().message(),
-                  MovementState::OUTCOME_UNKNOWN);
+    // A late report from an earlier attempt must never be consumed as this
+    // attempt's outcome, so the result is matched on both movement and attempt
+    // before it is believed. Anything else is recorded and waited past.
+    AttemptResult result;
+    bool accepted_result = false;
+    std::uint32_t discarded = 0;
+    while (!accepted_result) {
+      const auto answer =
+          await(destination_link.value(), result_key, result_future, "the attempt result");
+      if (!answer.ok()) {
+        return fail(answer.status().code(),
+                    "the destination never reported an outcome: " + answer.status().message(),
+                    MovementState::OUTCOME_UNKNOWN);
+      }
+      const auto decoded = decode_message<AttemptResult>(answer.value());
+      if (!decoded.ok()) {
+        return fail(decoded.status().code(), decoded.status().message(),
+                    MovementState::OUTCOME_UNKNOWN);
+      }
+      if (decoded.value().movement_id != record.id || decoded.value().attempt != attempt) {
+        ++discarded;
+        const Status noted = record.provenance.append(
+            ProvenanceEventKind::STALE_REJECTED, record.state, record.generation,
+            ReasonCode::STALE_ATTEMPT, system_clock().unix_millis(),
+            "discarded a completion that names a different movement or attempt");
+        (void)noted;
+        if (discarded >= 4) {
+          return fail(ReasonCode::STALE_ATTEMPT,
+                      "only stale completions arrived for this attempt",
+                      MovementState::OUTCOME_UNKNOWN);
+        }
+        auto re_reserved = reserve(destination_link.value(), result_key);
+        if (!re_reserved.ok()) return re_reserved.status();
+        result_future = std::move(re_reserved).value();
+        continue;
+      }
+      result = decoded.value();
+      accepted_result = true;
     }
 
-    if (result.value().state == MovementState::CANCELLED) {
-      return fail(result.value().code, result.value().detail, MovementState::CANCELLED);
+    if (result.state == MovementState::CANCELLED) {
+      return fail(result.code, result.detail, MovementState::CANCELLED);
     }
-    if (result.value().state != MovementState::BYTES_ARRIVED) {
-      record.last_reason = result.value().code;
-      record.last_detail = result.value().detail;
+    if (result.state != MovementState::BYTES_ARRIVED) {
+      record.last_reason = result.code;
+      record.last_detail = result.detail;
       if (attempt_number >= config_.policy.max_attempts) {
-        return fail(result.value().code,
-                    "the last permitted attempt failed: " + result.value().detail,
+        return fail(result.code, "the last permitted attempt failed: " + result.detail,
                     MovementState::FAILED);
       }
       count([](CoordinatorCounters& c) { c.movements_failed += 1; });
       (void)record.provenance.append(ProvenanceEventKind::RETRY_SCHEDULED, record.state,
-                                     record.generation, result.value().code,
-                                     system_clock().unix_millis(),
-                                     "retrying after: " + result.value().detail);
+                                     record.generation, result.code, system_clock().unix_millis(),
+                                     "retrying after: " + result.detail);
       const Status saved = store_->put(record);
       (void)saved;
       continue;
@@ -1324,9 +1383,9 @@ Status Coordinator::drive_movement(const MovementId& id) {
                                 "the destination reports verified bytes (not authority)"),
         ProvenanceEventKind::BYTES_ARRIVED, system_clock().unix_millis());
     if (!arrived.ok()) return arrived;
-    record.bytes_transferred = result.value().bytes;
-    record.chunks_verified = result.value().chunks;
-    record.destination_verified_digest = result.value().verified_digest;
+    record.bytes_transferred = result.bytes;
+    record.chunks_verified = result.chunks;
+    record.destination_verified_digest = result.verified_digest;
     SMF_RETURN_IF_ERROR(store_->put(record));
 
     // ---- independent verification --------------------------------------
@@ -1393,6 +1452,12 @@ Status Coordinator::drive_movement(const MovementId& id) {
       return fail(committed.status().code(), committed.status().message(),
                   MovementState::OUTCOME_UNKNOWN);
     }
+    if (committed.value().movement_id != record.id ||
+        committed.value().movement_generation != record.generation) {
+      return fail(ReasonCode::STALE_MOVEMENT_GENERATION,
+                  "the commit result answered a different movement generation",
+                  MovementState::OUTCOME_UNKNOWN);
+    }
     if (committed.value().code != ReasonCode::OK) {
       return fail(committed.value().code, committed.value().detail, MovementState::FAILED);
     }
@@ -1434,6 +1499,14 @@ Result<Digest> Coordinator::verify_destination(const MovementRecord& record) {
     if (!answer.ok()) return answer.status();
     auto response = decode_message<VerifyResponse>(answer.value());
     if (!response.ok()) return response.status();
+    // The probe is only believed when it answers the exact question that was
+    // asked: the same movement, the same object version.
+    if (response.value().movement_id != record.id ||
+        response.value().object_id != record.object.object_id ||
+        response.value().object_generation != record.object.generation) {
+      return Status(ReasonCode::STALE_ATTEMPT,
+                    "a verification response named a different movement or object version");
+    }
     if (response.value().code != ReasonCode::OK) {
       return Status(response.value().code, "the destination refused a verification probe");
     }
@@ -1553,6 +1626,11 @@ Status Coordinator::stop() {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       queue_.clear();
     }
+
+    // Release the durable store, and with it the exclusive lock on the state
+    // directory, so a supervisor can hand the directory to a new instance the
+    // moment this one reports that it has stopped.
+    store_.reset();
   });
   return Status::success();
 }

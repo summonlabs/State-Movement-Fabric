@@ -109,7 +109,16 @@ Result<CoordinatorPersistentState> CoordinatorPersistentState::decode(CanonicalD
 
 
 
-MovementStore::~MovementStore() = default;
+MovementStore::~MovementStore() {
+  // The exclusive lock and the open file handle are owned for the store's
+  // lifetime and must both be released here. Leaking either one leaves the
+  // directory permanently unusable and the final records unflushed.
+  close_file();
+  if (lock_handle_ != nullptr) {
+    delete static_cast<FileLock*>(lock_handle_);
+    lock_handle_ = nullptr;
+  }
+}
 
 Result<std::unique_ptr<MovementStore>> MovementStore::open(const MovementStoreOptions& options,
                                                           StoreRecoveryReport* report) {
@@ -261,10 +270,19 @@ Result<std::unique_ptr<MovementStore>> MovementStore::open(const MovementStoreOp
       return Status(ReasonCode::STORE_CHECKSUM_MISMATCH, "store record checksum mismatch");
     }
 
+    // The sequence number is checked before anything is applied. A duplicate or
+    // regressing sequence means the log was rewritten, spliced, or replayed, and
+    // the file is refused rather than silently reordered.
+    const std::uint64_t record_sequence = load_le(header.data() + 8, 8);
+    if (record_sequence <= sequence) {
+      return Status(ReasonCode::STORE_RECORD_INVALID,
+                    "store record sequence is not strictly increasing");
+    }
+
     const auto applied = store->apply_record(header[5], smf::as_bytes(payload));
     if (!applied.ok()) return applied;
 
-    sequence = load_le(header.data() + 8, 8);
+    sequence = record_sequence;
     local_report.records_read += 1;
     local_report.records_applied += 1;
     offset = next_offset;
@@ -535,7 +553,11 @@ Status MovementStore::compact() {
   fresh.close();
 
   auto* current = static_cast<FileHandle*>(file_);
-  if (current != nullptr) current->close();
+  if (current != nullptr) {
+    current->close();
+    delete current;
+    file_ = nullptr;
+  }
 
 #if defined(_WIN32)
   if (!MoveFileExW(temporary.wstring().c_str(), log_path_.wstring().c_str(),

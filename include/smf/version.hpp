@@ -20,7 +20,7 @@ inline constexpr std::uint16_t kCommitMarkerFormatVersion = 1;
 inline constexpr std::uint16_t kObjectStoreFormatVersion = 1;
 
 #ifndef SMF_VERSION_STRING
-#define SMF_VERSION_STRING "1.0.0"
+#define SMF_VERSION_STRING "1.0.1"
 #endif
 #ifndef SMF_VERSION_MAJOR
 #define SMF_VERSION_MAJOR 1
@@ -29,7 +29,7 @@ inline constexpr std::uint16_t kObjectStoreFormatVersion = 1;
 #define SMF_VERSION_MINOR 0
 #endif
 #ifndef SMF_VERSION_PATCH
-#define SMF_VERSION_PATCH 0
+#define SMF_VERSION_PATCH 1
 #endif
 
 inline constexpr std::string_view kVersionString = SMF_VERSION_STRING;

@@ -99,12 +99,15 @@ Status CompatibilityRegistry::publish(CompatibilityEvidence evidence, Millis now
     evidence.observed_unix_millis = now_unix_millis;
   }
 
+  std::lock_guard<std::mutex> lock(mutex_);
+  // The registry stamps the generation it is publishing under, so the evidence
+  // is complete before it is validated.
+  evidence.generation = generation_;
+
   const Status status = evidence.validate();
   if (!status.ok()) return status;
 
-  std::lock_guard<std::mutex> lock(mutex_);
   const Key key{evidence.object_id, evidence.state_generation, evidence.destination};
-  evidence.generation = generation_;
   evidence_.insert_or_assign(key, evidence);
   const auto advanced = generation_.next();
   if (advanced.ok()) generation_ = advanced.value();

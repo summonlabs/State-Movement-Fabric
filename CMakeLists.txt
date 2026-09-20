@@ -10,7 +10,7 @@
 cmake_minimum_required(VERSION 3.20...3.28)
 
 project(StateMovementFabric
-  VERSION 1.0.0
+  VERSION 1.0.1
   DESCRIPTION "Vendor-neutral C++20 runtime for governing cross-network movement of reusable AI state"
   HOMEPAGE_URL "https://github.com/summonlabs/State-Movement-Fabric"
   LANGUAGES CXX)
@@ -39,6 +39,25 @@ if(MSVC)
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin")
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/bin")
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}/bin")
+endif()
+
+if(SMF_ENABLE_CUDA)
+  # CUDA is used only by the device-memory proof surface and the endpoint's
+  # device publication path. The core library has no accelerator dependency.
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  # The device publication unit includes the public headers, so it must speak
+  # the same C++20 the rest of the tree does.
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  set(CMAKE_CUDA_EXTENSIONS OFF)
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    # Target the architecture of the device actually installed in this machine
+    # rather than a list of older ones, which also keeps nvcc quiet about
+    # deprecated offline targets.
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
+  message(STATUS "State Movement Fabric: CUDA proofs enabled (CUDAToolkit ${CUDAToolkit_VERSION})")
 endif()
 
 include(GNUInstallDirs)
