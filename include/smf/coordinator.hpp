@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -171,12 +172,16 @@ class Coordinator {
   [[nodiscard]] Status classify_attempt_failure(MovementRecord& record, const AttemptResult& result);
 
   [[nodiscard]] MovementSummary to_summary(const MovementRecord& record) const;
+  [[nodiscard]] Result<EndpointRegistration> endpoint_registration(const EndpointId& endpoint) const;
   void count(const std::function<void(CoordinatorCounters&)>& update);
 
   CoordinatorConfig config_;
   EndpointIncarnation incarnation_;
   PolicySet policy_;
   std::unique_ptr<MovementStore> store_;
+  // The live view is read and written by every session thread, by operator
+  // requests and by the movement workers.
+  mutable std::mutex topology_mutex_;
   TopologyView topology_;
   std::shared_ptr<CompatibilityProvider> compatibility_;
   CompatibilityGeneration compatibility_generation_{1};
@@ -204,6 +209,14 @@ class Coordinator {
   std::deque<MovementId> queue_;
   std::vector<std::thread> workers_;
   std::atomic<std::uint32_t> active_movements_{0};
+
+  // A movement is driven by one worker, and an operator can cancel or
+  // reconcile it from another thread. This lock makes each of them decide on
+  // the record as it is stored, so that a movement is concluded exactly once.
+  // committing_ holds the movements whose commit request has gone out: from
+  // that point the destination decides, and a cancellation comes too late.
+  std::mutex movement_mutex_;
+  std::set<MovementId> committing_;
 
   mutable std::mutex counters_mutex_;
   CoordinatorCounters counters_;

@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -20,9 +21,14 @@
 
 #include "smf/compatibility.hpp"
 #include "smf/coordinator.hpp"
+#include "smf/digest.hpp"
 #include "smf/endpoint_agent.hpp"
+#include "smf/framing.hpp"
 #include "smf/movement_store.hpp"
+#include "smf/session.hpp"
 #include "smf/topology.hpp"
+#include "smf/transport.hpp"
+#include "smf/wire.hpp"
 #include "smf_admin_client.hpp"
 #include "smf_fixture.hpp"
 #include "smf_test.hpp"
@@ -411,4 +417,450 @@ SMF_TEST(concurrency, repeated_endpoint_start_stop_cycles) {
     SMF_CHECK_OK(agent->stop());
   }
   SMF_CHECK_EQ(previous, std::uint64_t{12});
+}
+
+namespace {
+
+// An endpoint whose answers are scripted by the proof. It speaks the real
+// control protocol over a real authenticated session; only what it answers,
+// and when, is under the proof's control.
+class ScriptedEndpoint {
+ public:
+  [[nodiscard]] smf::Status connect(const smf::SocketAddress& address, const smf::Bytes& secret,
+                                    const smf::EndpointId& as) {
+    auto connection = smf::TcpConnection::connect(address, 10000);
+    if (!connection.ok()) return connection.status();
+    stream_ = std::make_unique<smf::FrameStream>(std::move(connection).value(), 10000, 4U << 20);
+
+    smf::IdIssuer issuer;
+    smf::PeerIdentity identity;
+    identity.endpoint = as;
+    identity.boot = issuer.new_boot_id();
+    identity.epoch = smf::IncarnationEpoch(1);
+    identity.role = smf::SessionRole::ENDPOINT;
+    identity.contract = std::string(smf::kPeerContract);
+    identity.capability_digest = smf::sha256(std::string_view("smf-test-scripted-endpoint"));
+
+    const auto request = smf::make_hello_request(smf::as_bytes(secret), identity, issuer);
+    if (!request.ok()) return request.status();
+    {
+      smf::CanonicalEncoder encoder;
+      request.value().encode(encoder);
+      SMF_RETURN_IF_ERROR(stream_->send(smf::MessageType::HELLO, encoder.view()));
+    }
+    const auto frame = stream_->receive();
+    if (!frame.ok()) return frame.status();
+    if (frame.value().header.type != smf::MessageType::HELLO_ACK) {
+      return smf::Status(smf::ReasonCode::PROTOCOL_HANDSHAKE_FAILED,
+                         "the coordinator refused the endpoint session");
+    }
+    const auto response = smf::decode_message<smf::HelloResponse>(frame.value());
+    if (!response.ok()) return response.status();
+    const auto key =
+        smf::verify_hello_response(smf::as_bytes(secret), request.value(), response.value());
+    if (!key.ok()) return key.status();
+    stream_->codec().set_session_key(key.value().view());
+
+    smf::RegisterRequest registration;
+    registration.identity.endpoint = as;
+    registration.identity.boot = identity.boot;
+    registration.identity.epoch = identity.epoch;
+    registration.identity.role = static_cast<std::uint8_t>(smf::SessionRole::ENDPOINT);
+    registration.identity.contract = identity.contract;
+    registration.identity.capability_digest = identity.capability_digest;
+    registration.service_address = smf::SocketAddress::parse("127.0.0.1:1").value();
+    registration.data_address = smf::SocketAddress::parse("127.0.0.1:2").value();
+    registration.inventory_digest = smf::sha256(std::string_view("empty-inventory"));
+    SMF_RETURN_IF_ERROR(smf::send_message(*stream_, registration));
+    const auto ack = smf::receive_message<smf::RegisterAck>(*stream_);
+    return ack.ok() ? smf::Status::success() : ack.status();
+  }
+
+  template <class Message>
+  [[nodiscard]] smf::Status send(const Message& message) {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    return smf::send_message(*stream_, message);
+  }
+
+  [[nodiscard]] smf::Result<smf::Frame> receive() { return stream_->receive(); }
+
+ private:
+  std::unique_ptr<smf::FrameStream> stream_;
+  std::mutex send_mutex_;
+};
+
+[[nodiscard]] smf::EndpointAgentConfig agent_config(const smf::Coordinator& coordinator,
+                                                    const std::string& name,
+                                                    const std::filesystem::path& root) {
+  smf::EndpointAgentConfig config;
+  config.endpoint_id = smf::EndpointId::parse(name).value();
+  config.store_root = root;
+  config.shared_secret = test_secret();
+  config.coordinator_address = coordinator.endpoint_address();
+  config.sync_store = false;
+  config.max_data_sessions = 2;
+  return config;
+}
+
+}  // namespace
+
+SMF_TEST(concurrency, a_cancelled_movement_is_not_committed_by_a_late_transfer_result) {
+  smftest::TempDir dir("conc-cancel-commit");
+  smf::CoordinatorConfig config = coordinator_config(dir.path() / "state");
+  config.io_budget_millis = 5000;
+  auto started = smf::Coordinator::start(config);
+  SMF_CHECK_OK(started);
+  if (!started.ok()) return;
+  std::unique_ptr<smf::Coordinator> coordinator = std::move(started).value();
+
+  // A real source that holds the object.
+  auto source_started =
+      smf::EndpointAgent::start(agent_config(*coordinator, "race-source", dir.path() / "source"));
+  SMF_CHECK_OK(source_started);
+  if (!source_started.ok()) return;
+  std::unique_ptr<smf::EndpointAgent> source = std::move(source_started).value();
+  SMF_CHECK_OK(source->connect_to_coordinator());
+  const smf::Bytes contents = smftest::pattern_bytes(0x5EED, 96U << 10);
+  smf::StateObjectDescriptor object;
+  SMF_CHECK_OK(source->publish_bytes(smf::StateKind::KV, "race/cancelled-object",
+                                     smf::StateGeneration(1), smf::as_bytes(contents), "proof", true,
+                                     &object));
+  SMF_CHECK_OK(source->announce(object));
+
+  // A destination that reports a finished transfer only when the proof says so,
+  // and that answers every verification and commit request the way a
+  // destination holding the bytes would.
+  ScriptedEndpoint destination;
+  const smf::EndpointId destination_id = smf::EndpointId::parse("race-destination").value();
+  SMF_CHECK_OK(destination.connect(coordinator->endpoint_address(), test_secret(), destination_id));
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool execute_seen = false;
+  smf::ExecuteMovement execute;
+  std::atomic<int> commit_requests{0};
+
+  // A failed check leaves the proof by exception. Whatever happens, the
+  // coordinator is stopped first, which ends the responder's session, and the
+  // responder is joined.
+  std::thread responder;
+  struct Teardown {
+    smf::Coordinator& coordinator;
+    std::thread& thread;
+    ~Teardown() {
+      const smf::Status stopped = coordinator.stop();
+      (void)stopped;
+      if (thread.joinable()) thread.join();
+    }
+  } teardown{*coordinator, responder};
+
+  responder = std::thread([&]() {
+    for (;;) {
+      const auto frame = destination.receive();
+      if (!frame.ok()) return;
+      switch (frame.value().header.type) {
+        case smf::MessageType::GRANT_TRANSFER: {
+          const auto message = smf::decode_message<smf::GrantTransfer>(frame.value());
+          if (!message.ok()) return;
+          smf::GrantAck ack;
+          ack.nonce = smf::Digest(message.value().grant.grant_nonce.bytes());
+          ack.code = ReasonCode::OK;
+          ack.detail = "grant accepted";
+          if (!destination.send(ack).ok()) return;
+          break;
+        }
+        case smf::MessageType::EXECUTE_MOVEMENT: {
+          const auto message = smf::decode_message<smf::ExecuteMovement>(frame.value());
+          if (!message.ok()) return;
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            execute = message.value();
+            execute_seen = true;
+          }
+          cv.notify_all();
+          break;
+        }
+        case smf::MessageType::CANCEL: {
+          const auto message = smf::decode_message<smf::CancelRequest>(frame.value());
+          if (!message.ok()) return;
+          smf::CancelAck ack;
+          ack.movement_id = message.value().movement_id;
+          ack.movement_generation = message.value().movement_generation;
+          ack.code = ReasonCode::OK;
+          ack.detail = "cancellation recorded";
+          if (!destination.send(ack).ok()) return;
+          break;
+        }
+        case smf::MessageType::VERIFY_REQUEST: {
+          const auto message = smf::decode_message<smf::VerifyRequest>(frame.value());
+          if (!message.ok()) return;
+          smf::VerifyResponse response;
+          response.movement_id = message.value().movement_id;
+          response.object_id = message.value().object_id;
+          response.object_generation = message.value().object_generation;
+          response.code = ReasonCode::OK;
+          response.stored_bytes = object.total_bytes;
+          if (message.value().full_digest_requested) {
+            response.stored_digest = object.content_digest;
+          } else {
+            const std::uint32_t index = message.value().chunk_index;
+            const std::uint64_t offset = object.chunk_offset(index).value();
+            const std::uint64_t length = object.chunk_length(index).value();
+            response.chunk_index = index;
+            response.chunk_payload.assign(
+                contents.begin() + static_cast<std::ptrdiff_t>(offset),
+                contents.begin() + static_cast<std::ptrdiff_t>(offset + length));
+            response.chunk_digest = smf::compute_chunk_digest(
+                object.object_id, object.generation, index, offset, length,
+                smf::as_bytes(response.chunk_payload));
+          }
+          if (!destination.send(response).ok()) return;
+          break;
+        }
+        case smf::MessageType::COMMIT_REQUEST: {
+          const auto message = smf::decode_message<smf::CommitRequest>(frame.value());
+          if (!message.ok()) return;
+          commit_requests.fetch_add(1);
+          smf::CommitResult result;
+          result.movement_id = message.value().movement_id;
+          result.movement_generation = message.value().movement_generation;
+          result.code = ReasonCode::OK;
+          result.marker_digest = smf::sha256(std::string_view("scripted-marker"));
+          result.detail = "commit marker written";
+          if (!destination.send(result).ok()) return;
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  });
+
+  smf::SubmitMovement request;
+  request.object_id = object.object_id;
+  request.object_generation = object.generation;
+  request.source = source->endpoint_id();
+  request.destination = destination_id;
+  const auto accepted = coordinator->submit(request);
+  SMF_CHECK_OK(accepted);
+
+  if (accepted.ok()) {
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      cv.wait(lock, [&]() { return execute_seen; });
+    }
+
+    // The operator cancels while the transfer is running, and is told so.
+    const auto cancelled = coordinator->cancel(accepted.value().movement_id);
+    SMF_CHECK_OK(cancelled);
+    if (cancelled.ok()) SMF_CHECK_EQ(cancelled.value().state, smf::MovementState::CANCELLED);
+
+    // The destination had in fact finished, and its report arrives now.
+    smf::AttemptResult result;
+    result.movement_id = execute.movement_id;
+    result.movement_generation = execute.movement_generation;
+    result.attempt = execute.attempt;
+    result.state = smf::MovementState::BYTES_ARRIVED;
+    result.code = ReasonCode::OK;
+    result.detail = "every chunk was written";
+    result.verified_digest = object.content_digest;
+    result.bytes = object.total_bytes;
+    result.chunks = object.chunk_count;
+    SMF_CHECK_OK(destination.send(result));
+
+    coordinator->wait_for_idle();
+
+    // What the operator was told is what the record says, and nothing was
+    // committed on behalf of a cancelled movement.
+    const auto record = coordinator->query(accepted.value().movement_id);
+    SMF_CHECK_OK(record);
+    if (record.ok()) SMF_CHECK_EQ(record.value().state, smf::MovementState::CANCELLED);
+    SMF_CHECK_EQ(commit_requests.load(), 0);
+    const smf::CoordinatorCounters counters = coordinator->counters();
+    SMF_CHECK_EQ(counters.movements_committed, std::uint64_t{0});
+    SMF_CHECK_EQ(counters.movements_cancelled, std::uint64_t{1});
+  }
+}
+
+SMF_TEST(concurrency, a_movement_of_unknown_outcome_is_not_resolved_by_a_cancellation) {
+  smftest::TempDir dir("conc-unknown-cancel");
+  smf::CoordinatorConfig config = coordinator_config(dir.path() / "state");
+  config.io_budget_millis = 5000;
+  auto started = smf::Coordinator::start(config);
+  SMF_CHECK_OK(started);
+  if (!started.ok()) return;
+  std::unique_ptr<smf::Coordinator> coordinator = std::move(started).value();
+
+  auto source_started = smf::EndpointAgent::start(
+      agent_config(*coordinator, "unknown-source", dir.path() / "source"));
+  SMF_CHECK_OK(source_started);
+  if (!source_started.ok()) return;
+  std::unique_ptr<smf::EndpointAgent> source = std::move(source_started).value();
+  SMF_CHECK_OK(source->connect_to_coordinator());
+  const smf::Bytes contents = smftest::pattern_bytes(0xC0DE, 64U << 10);
+  smf::StateObjectDescriptor object;
+  SMF_CHECK_OK(source->publish_bytes(smf::StateKind::KV, "race/unknown-object",
+                                     smf::StateGeneration(1), smf::as_bytes(contents), "proof", true,
+                                     &object));
+  SMF_CHECK_OK(source->announce(object));
+
+  // A destination that accepts the grant, is told to start, and is then lost
+  // without reporting anything: whether it took the object is not known.
+  const smf::EndpointId destination_id = smf::EndpointId::parse("unknown-destination").value();
+  smf::MovementId id;
+  {
+    ScriptedEndpoint destination;
+    SMF_CHECK_OK(destination.connect(coordinator->endpoint_address(), test_secret(), destination_id));
+
+    smf::SubmitMovement request;
+    request.object_id = object.object_id;
+    request.object_generation = object.generation;
+    request.source = source->endpoint_id();
+    request.destination = destination_id;
+    const auto accepted = coordinator->submit(request);
+    SMF_CHECK_OK(accepted);
+    if (!accepted.ok()) return;
+    id = accepted.value().movement_id;
+
+    bool told_to_start = false;
+    while (!told_to_start) {
+      const auto frame = destination.receive();
+      SMF_REQUIRE(frame.ok());
+      if (frame.value().header.type == smf::MessageType::GRANT_TRANSFER) {
+        const auto message = smf::decode_message<smf::GrantTransfer>(frame.value());
+        SMF_REQUIRE(message.ok());
+        smf::GrantAck ack;
+        ack.nonce = smf::Digest(message.value().grant.grant_nonce.bytes());
+        ack.code = ReasonCode::OK;
+        ack.detail = "grant accepted";
+        SMF_CHECK_OK(destination.send(ack));
+      } else if (frame.value().header.type == smf::MessageType::EXECUTE_MOVEMENT) {
+        told_to_start = true;
+      }
+    }
+  }
+
+  coordinator->wait_for_idle();
+  const auto unknown = coordinator->query(id);
+  SMF_CHECK_OK(unknown);
+  if (unknown.ok()) SMF_CHECK_EQ(unknown.value().state, smf::MovementState::OUTCOME_UNKNOWN);
+
+  // The operator cannot settle by decree what only the destination can prove.
+  const auto cancelled = coordinator->cancel(id);
+  SMF_CHECK(!cancelled.ok());
+  SMF_CHECK_EQ(cancelled.status().code(), ReasonCode::OUTCOME_UNKNOWN);
+
+  const auto after = coordinator->query(id);
+  SMF_CHECK_OK(after);
+  if (after.ok()) SMF_CHECK_EQ(after.value().state, smf::MovementState::OUTCOME_UNKNOWN);
+  SMF_CHECK_EQ(coordinator->counters().movements_cancelled, std::uint64_t{0});
+
+  SMF_CHECK_OK(source->stop());
+  SMF_CHECK_OK(coordinator->stop());
+}
+
+SMF_TEST(concurrency, an_ended_session_does_not_take_down_its_successors_registration) {
+  smftest::TempDir dir("conc-successor");
+  smf::CoordinatorConfig config = coordinator_config(dir.path() / "state");
+  config.max_sessions = 2;
+  auto started = smf::Coordinator::start(config);
+  SMF_CHECK_OK(started);
+  if (!started.ok()) return;
+  std::unique_ptr<smf::Coordinator> coordinator = std::move(started).value();
+
+  auto first_started = smf::EndpointAgent::start(
+      agent_config(*coordinator, "restarting-endpoint", dir.path() / "first"));
+  SMF_CHECK_OK(first_started);
+  if (!first_started.ok()) return;
+  std::unique_ptr<smf::EndpointAgent> first = std::move(first_started).value();
+  SMF_CHECK_OK(first->connect_to_coordinator());
+
+  // The endpoint is restarted: its replacement registers under the same name
+  // while the session of the process it replaces is still open.
+  auto second_started = smf::EndpointAgent::start(
+      agent_config(*coordinator, "restarting-endpoint", dir.path() / "second"));
+  SMF_CHECK_OK(second_started);
+  if (!second_started.ok()) return;
+  std::unique_ptr<smf::EndpointAgent> second = std::move(second_started).value();
+  SMF_CHECK_OK(second->connect_to_coordinator());
+
+  // Only now does the old session end.
+  SMF_CHECK_OK(first->stop());
+
+  // The coordinator serves two sessions at most, so an operator session is
+  // admitted only once it has finished tearing the old one down.
+  bool torn_down = false;
+  for (int attempt = 0; attempt < 500 && !torn_down; ++attempt) {
+    smftest::AdminClient probe;
+    torn_down = probe.connect(coordinator->admin_address(), test_secret(),
+                              smf::EndpointId::parse("teardown-probe").value())
+                    .ok();
+    if (!torn_down) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  SMF_CHECK(torn_down);
+
+  // The replacement is registered, connected and alive, and it will never
+  // register again: it must still be live.
+  const smf::TopologyReport report = coordinator->topology_report();
+  SMF_CHECK_EQ(report.endpoints.size(), std::size_t{1});
+  if (!report.endpoints.empty()) {
+    SMF_CHECK(report.endpoints.front().live);
+    SMF_CHECK(report.endpoints.front().incarnation == second->incarnation());
+  }
+
+  SMF_CHECK_OK(second->stop());
+  SMF_CHECK_OK(coordinator->stop());
+}
+
+SMF_TEST(concurrency, endpoints_registering_at_once_all_appear_in_the_topology) {
+  smftest::TempDir dir("conc-register");
+  smf::CoordinatorConfig config = coordinator_config(dir.path() / "state");
+  config.max_sessions = 64;
+  auto started = smf::Coordinator::start(config);
+  SMF_CHECK_OK(started);
+  if (!started.ok()) return;
+  std::unique_ptr<smf::Coordinator> coordinator = std::move(started).value();
+
+  // A fleet starting together: every endpoint registers at the same moment
+  // while an operator keeps reading the topology.
+  constexpr int kEndpoints = 24;
+  Latch latch(kEndpoints + 1);
+  std::atomic<int> registered{0};
+  std::atomic<bool> reading{true};
+  std::vector<std::unique_ptr<ScriptedEndpoint>> endpoints;
+  for (int index = 0; index < kEndpoints; ++index) {
+    endpoints.push_back(std::make_unique<ScriptedEndpoint>());
+  }
+  std::vector<std::thread> threads;
+  for (int index = 0; index < kEndpoints; ++index) {
+    threads.emplace_back([&, index]() {
+      latch.arrive_and_wait();
+      const smf::Status status = endpoints[static_cast<std::size_t>(index)]->connect(
+          coordinator->endpoint_address(), test_secret(),
+          smf::EndpointId::parse("fleet-" + std::to_string(index)).value());
+      if (status.ok()) registered.fetch_add(1);
+    });
+  }
+  std::thread reader([&]() {
+    latch.arrive_and_wait();
+    while (reading.load()) {
+      const smf::TopologyReport report = coordinator->topology_report();
+      (void)report;
+    }
+  });
+  for (std::thread& thread : threads) thread.join();
+  reading.store(false);
+  reader.join();
+
+  SMF_CHECK_EQ(registered.load(), kEndpoints);
+  const smf::TopologyReport report = coordinator->topology_report();
+  SMF_CHECK_EQ(report.endpoints.size(), static_cast<std::size_t>(kEndpoints));
+  std::set<std::string> names;
+  for (const smf::EndpointRegistration& endpoint : report.endpoints) {
+    SMF_CHECK(endpoint.live);
+    names.insert(endpoint.endpoint.value());
+  }
+  SMF_CHECK_EQ(names.size(), static_cast<std::size_t>(kEndpoints));
+
+  SMF_CHECK_OK(coordinator->stop());
 }

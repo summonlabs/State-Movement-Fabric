@@ -190,7 +190,15 @@ SocketAddress Coordinator::admin_address() const {
   return admin_listener_ != nullptr ? admin_listener_->address() : SocketAddress{};
 }
 
-TopologyGeneration Coordinator::topology_generation() const { return topology_.generation(); }
+TopologyGeneration Coordinator::topology_generation() const {
+  std::lock_guard<std::mutex> lock(topology_mutex_);
+  return topology_.generation();
+}
+
+Result<EndpointRegistration> Coordinator::endpoint_registration(const EndpointId& endpoint) const {
+  std::lock_guard<std::mutex> lock(topology_mutex_);
+  return topology_.find(endpoint);
+}
 
 CoordinatorCounters Coordinator::counters() const {
   std::lock_guard<std::mutex> lock(counters_mutex_);
@@ -340,15 +348,30 @@ Status Coordinator::session_loop(TcpConnection connection, bool admin) {
     }
     link->pending.clear();
   }
+  // Only the registrations this session still holds go down with it. An
+  // endpoint that restarted registers again over a new session, and the old
+  // session can end after that: marking the name dead then would take down the
+  // registration of the process that replaced it, which is alive and never
+  // registers a second time. The same goes for a session that never
+  // registered at all.
+  std::vector<EndpointId> registered;
   {
     std::lock_guard<std::mutex> lock(links_mutex_);
     for (auto it = links_.begin(); it != links_.end();) {
-      it = (it->second == link) ? links_.erase(it) : std::next(it);
+      if (it->second == link) {
+        registered.push_back(it->first);
+        it = links_.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
   if (!admin) {
-    const Status removed = topology_.mark_dead(link->endpoint);
-    (void)removed;
+    std::lock_guard<std::mutex> lock(topology_mutex_);
+    for (const EndpointId& endpoint : registered) {
+      const Status removed = topology_.mark_dead(endpoint);
+      (void)removed;
+    }
   }
   return Status::success();
 }
@@ -535,9 +558,12 @@ Status Coordinator::handle_endpoint_message(const std::shared_ptr<ControlLink>& 
       registration.registered_unix_millis = system_clock().unix_millis();
       registration.live = true;
 
-      SMF_RETURN_IF_ERROR(topology_.put(registration, config_.policy.max_endpoints));
-      const auto advanced = topology_.advance();
-      if (!advanced.ok()) return advanced.status();
+      {
+        std::lock_guard<std::mutex> lock(topology_mutex_);
+        SMF_RETURN_IF_ERROR(topology_.put(registration, config_.policy.max_endpoints));
+        const auto advanced = topology_.advance();
+        if (!advanced.ok()) return advanced.status();
+      }
 
       {
         std::lock_guard<std::mutex> lock(links_mutex_);
@@ -545,7 +571,7 @@ Status Coordinator::handle_endpoint_message(const std::shared_ptr<ControlLink>& 
       }
 
       RegisterAck ack;
-      ack.topology_generation = topology_.generation();
+      ack.topology_generation = topology_generation();
       ack.policy_generation = policy_.generation;
       ack.coordinator = incarnation_;
       ack.policy_digest = policy_.digest();
@@ -830,9 +856,9 @@ Result<MovementAccepted> Coordinator::submit(const SubmitMovement& request) {
   }
 
   // ---- authority checks: both endpoints must be live right now -------------
-  const auto source_registration = topology_.find(request.source);
+  const auto source_registration = endpoint_registration(request.source);
   if (!source_registration.ok()) return source_registration.status();
-  const auto destination_registration = topology_.find(request.destination);
+  const auto destination_registration = endpoint_registration(request.destination);
   if (!destination_registration.ok()) return destination_registration.status();
   if (!source_registration.value().live || !destination_registration.value().live) {
     return Status(ReasonCode::ENDPOINT_NOT_LIVE, "one of the endpoints is not currently live");
@@ -885,7 +911,7 @@ Result<MovementAccepted> Coordinator::submit(const SubmitMovement& request) {
   record.source_incarnation = source_incarnation;
   record.destination_incarnation = destination_incarnation;
   record.compatibility_generation = compatibility_generation_;
-  record.topology_generation = topology_.generation();
+  record.topology_generation = topology_generation();
   record.policy_generation = policy_.generation;
   record.state = MovementState::PLANNED;
   record.last_reason = ReasonCode::OK;
@@ -974,7 +1000,24 @@ Result<MovementRecord> Coordinator::cancel(const MovementId& id) {
                   std::string("the movement is already ") + to_string(record.state));
   }
 
-  record.cancel_requested = true;
+  // A movement whose outcome is unknown may already have taken effect at the
+  // destination. Only reconciliation resolves it, on the destination's proof;
+  // recording it as cancelled here would deny an effect that may exist.
+  const Status unresolved(ReasonCode::OUTCOME_UNKNOWN,
+                          "the outcome of the movement is unknown: it may already have taken "
+                          "effect at the destination, so it cannot be cancelled and has to be "
+                          "reconciled");
+  if (record.state == MovementState::OUTCOME_UNKNOWN) return unresolved;
+
+  // Once the commit request has gone out the destination decides the outcome,
+  // and a cancellation recorded now would contradict whatever it answers.
+  const Status too_late(ReasonCode::BUSY,
+                        "the movement has reached its commit barrier and can no longer be "
+                        "cancelled; its outcome is recorded when the destination answers");
+  {
+    std::lock_guard<std::mutex> lock(movement_mutex_);
+    if (committing_.count(id) != 0) return too_late;
+  }
 
   // Tell both endpoints before recording the decision, so that a transfer that
   // is already running stops at the next chunk boundary.
@@ -988,6 +1031,23 @@ Result<MovementRecord> Coordinator::cancel(const MovementId& id) {
     const auto answer = request(link.value(), key, MessageType::CANCEL, encoder);
     (void)answer;
   }
+
+  // The movement kept moving while the endpoints were being told. The decision
+  // is applied to the record as it is stored now, under the lock its worker
+  // writes under: applied to the copy read earlier, it would be overwritten by
+  // the worker's next step, or would overwrite a conclusion the worker reached
+  // in the meantime.
+  std::lock_guard<std::mutex> lock(movement_mutex_);
+  if (committing_.count(id) != 0) return too_late;
+  auto current = store_->get(id);
+  if (!current.ok()) return current.status();
+  record = current.value();
+  if (record.is_terminal()) {
+    return Status(ReasonCode::ALREADY_TERMINAL,
+                  std::string("the movement is already ") + to_string(record.state));
+  }
+  if (record.state == MovementState::OUTCOME_UNKNOWN) return unresolved;
+  record.cancel_requested = true;
 
   const Status applied = apply_transition(record, MovementState::CANCELLED,
                                           MovementDecision::deny(ReasonCode::CANCELLED_BY_OPERATOR,
@@ -1039,6 +1099,21 @@ Result<MovementRecord> Coordinator::reconcile(const MovementId& id) {
   }
   const auto report = decode_message<AuthorityReport>(answer.value());
   if (!report.ok()) return report.status();
+
+  // The answer took a round trip. It is applied to the record as it is stored
+  // now, and only if it is still waiting to be reconciled.
+  std::lock_guard<std::mutex> lock(movement_mutex_);
+  {
+    auto current = store_->get(id);
+    if (!current.ok()) return current.status();
+    record = current.value();
+    if (record.state != MovementState::OUTCOME_UNKNOWN) {
+      return Status(ReasonCode::MOVEMENT_NOT_RECONCILABLE,
+                    std::string("the movement was concluded while it was being reconciled; "
+                                "it is now ") +
+                        to_string(record.state));
+    }
+  }
 
   const bool marker_present = report.value().marker_present;
   const bool marker_is_mine = report.value().authoritative && report.value().verified &&
@@ -1103,6 +1178,7 @@ Result<ProvenanceReport> Coordinator::provenance(const MovementId& id) const {
 
 TopologyReport Coordinator::topology_report() const {
   TopologyReport report;
+  std::lock_guard<std::mutex> lock(topology_mutex_);
   report.topology_generation = topology_.generation();
   report.coordinator = incarnation_;
   report.endpoints = topology_.endpoints();
@@ -1162,7 +1238,19 @@ void Coordinator::worker_loop() {
   }
 }
 
-Status Coordinator::persist(MovementRecord& record) { return store_->put(record); }
+// Every step a worker records goes through here. A movement that another
+// decision has already concluded - an operator's cancellation - stays as that
+// decision left it: the worker's step is refused instead of written over it.
+Status Coordinator::persist(MovementRecord& record) {
+  std::lock_guard<std::mutex> lock(movement_mutex_);
+  const auto stored = store_->get(record.id);
+  if (stored.ok() && stored.value().is_terminal()) {
+    return Status(ReasonCode::ALREADY_TERMINAL,
+                  std::string("the movement was already concluded as ") +
+                      to_string(stored.value().state));
+  }
+  return store_->put(record);
+}
 
 
 Status Coordinator::drive_movement(const MovementId& id) {
@@ -1183,8 +1271,9 @@ Status Coordinator::drive_movement(const MovementId& id) {
                                                        : ProvenanceEventKind::FAILED),
                                             system_clock().unix_millis());
     if (applied.ok()) {
-      const Status saved = store_->put(record);
-      (void)saved;
+      const Status saved = persist(record);
+      // Concluded elsewhere first: that conclusion stands, and is counted once.
+      if (saved.code() == ReasonCode::ALREADY_TERMINAL) return saved;
     }
     count([state](CoordinatorCounters& c) {
       if (state == MovementState::CANCELLED) {
@@ -1216,8 +1305,8 @@ Status Coordinator::drive_movement(const MovementId& id) {
 
   // The endpoint incarnations recorded at authorization time must still be the
   // ones that are live now: a restarted endpoint invalidates the decision.
-  const auto current_source = topology_.find(record.source);
-  const auto current_destination = topology_.find(record.destination);
+  const auto current_source = endpoint_registration(record.source);
+  const auto current_destination = endpoint_registration(record.destination);
   if (!current_source.ok() || !current_destination.ok()) {
     return fail(ReasonCode::STALE_INCARNATION, "an endpoint left the topology",
                 MovementState::FAILED);
@@ -1241,7 +1330,7 @@ Status Coordinator::drive_movement(const MovementId& id) {
     IdIssuer issuer;
     const TransferAttemptId attempt = issuer.new_attempt_id();
     SMF_RETURN_IF_ERROR(record_attempt_started(record, attempt, system_clock().unix_millis()));
-    SMF_RETURN_IF_ERROR(store_->put(record));
+    SMF_RETURN_IF_ERROR(persist(record));
 
     TransferGrant grant;
     grant.movement_id = record.id;
@@ -1316,7 +1405,7 @@ Status Coordinator::drive_movement(const MovementId& id) {
       release(destination_link.value(), result_key);
       return transfer;
     }
-    SMF_RETURN_IF_ERROR(store_->put(record));
+    SMF_RETURN_IF_ERROR(persist(record));
 
     // A late report from an earlier attempt must never be consumed as this
     // attempt's outcome, so the result is matched on both movement and attempt
@@ -1372,8 +1461,8 @@ Status Coordinator::drive_movement(const MovementId& id) {
       (void)record.provenance.append(ProvenanceEventKind::RETRY_SCHEDULED, record.state,
                                      record.generation, result.code, system_clock().unix_millis(),
                                      "retrying after: " + result.detail);
-      const Status saved = store_->put(record);
-      (void)saved;
+      const Status saved = persist(record);
+      if (saved.code() == ReasonCode::ALREADY_TERMINAL) return saved;
       continue;
     }
 
@@ -1386,7 +1475,7 @@ Status Coordinator::drive_movement(const MovementId& id) {
     record.bytes_transferred = result.bytes;
     record.chunks_verified = result.chunks;
     record.destination_verified_digest = result.verified_digest;
-    SMF_RETURN_IF_ERROR(store_->put(record));
+    SMF_RETURN_IF_ERROR(persist(record));
 
     // ---- independent verification --------------------------------------
     const auto verified = verify_destination(record);
@@ -1404,8 +1493,8 @@ Status Coordinator::drive_movement(const MovementId& id) {
           verified.status().code(), system_clock().unix_millis(),
           "independent verification refused the bytes: " + verified.status().message());
       (void)noted;
-      const Status saved_retry = store_->put(record);
-      (void)saved_retry;
+      const Status saved_retry = persist(record);
+      if (saved_retry.code() == ReasonCode::ALREADY_TERMINAL) return saved_retry;
       count([](CoordinatorCounters& c) { c.attempts_failed += 1; });
       continue;
     }
@@ -1418,12 +1507,34 @@ Status Coordinator::drive_movement(const MovementId& id) {
         ProvenanceEventKind::VERIFIED, system_clock().unix_millis());
     if (!verified_transition.ok()) return verified_transition;
     record.source_verified_digest = verified.value();
-    SMF_RETURN_IF_ERROR(store_->put(record));
+    SMF_RETURN_IF_ERROR(persist(record));
 
     if (record.cancel_requested) {
       return fail(ReasonCode::CANCELLED_BY_OPERATOR, "cancelled at the commit barrier",
                   MovementState::CANCELLED);
     }
+
+    // The commit barrier is claimed before the request goes out. A movement
+    // that was cancelled in the meantime never reaches the destination's commit
+    // path, and one that has claimed the barrier can no longer be cancelled.
+    {
+      std::lock_guard<std::mutex> lock(movement_mutex_);
+      const auto current = store_->get(record.id);
+      if (current.ok() && current.value().is_terminal()) {
+        return Status(ReasonCode::ALREADY_TERMINAL,
+                      std::string("the movement was already concluded as ") +
+                          to_string(current.value().state));
+      }
+      committing_.insert(record.id);
+    }
+    struct CommitBarrier {
+      Coordinator& owner;
+      MovementId id;
+      ~CommitBarrier() {
+        std::lock_guard<std::mutex> lock(owner.movement_mutex_);
+        owner.committing_.erase(id);
+      }
+    } barrier{*this, record.id};
 
     fault_point(fault_points::kCoordinatorBeforeCommit);
 
@@ -1469,7 +1580,7 @@ Status Coordinator::drive_movement(const MovementId& id) {
         ProvenanceEventKind::COMMITTED, system_clock().unix_millis());
     if (!final_transition.ok()) return final_transition;
     record.commit_marker_digest = committed.value().marker_digest;
-    SMF_RETURN_IF_ERROR(store_->put(record));
+    SMF_RETURN_IF_ERROR(persist(record));
     count([](CoordinatorCounters& c) { c.movements_committed += 1; });
     return Status::success();
   }
