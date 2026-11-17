@@ -17,6 +17,7 @@
 #include <deque>
 #include <filesystem>
 #include <future>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -191,6 +192,9 @@ class Coordinator {
   std::thread endpoint_accept_thread_;
   std::thread admin_accept_thread_;
   std::vector<std::thread> session_threads_;
+  // The connection of every session being served, registered or not, so that
+  // request_shutdown() can end a read that is waiting on a silent peer.
+  std::list<TcpConnection> session_connections_;
   std::mutex sessions_mutex_;
   std::atomic<std::uint32_t> active_sessions_{0};
 

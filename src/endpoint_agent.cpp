@@ -287,6 +287,15 @@ Status EndpointAgent::request_shutdown() {
     }
     control_->pending.clear();
   }
+  {
+    // A transfer or a data session may be blocked reading from its peer: end
+    // that read rather than leave it to run out its budget.
+    std::lock_guard<std::mutex> lock(movement_workers_mutex_);
+    for (TcpConnection& connection : data_connections_) {
+      const Status ended = connection.shutdown();
+      (void)ended;
+    }
+  }
   queue_cv_.notify_all();
   wake_.notify_all();
   return Status::success();
@@ -302,6 +311,16 @@ Status EndpointAgent::stop() {
       if (worker.joinable()) worker.join();
     }
     session_workers_.clear();
+    // Transfers work on this agent and report through the coordinator link, so
+    // they end before the link is released below and before stop() returns.
+    std::list<MovementWorker> transfers;
+    {
+      std::lock_guard<std::mutex> lock(movement_workers_mutex_);
+      transfers.swap(movement_workers_);
+    }
+    for (MovementWorker& transfer : transfers) {
+      if (transfer.thread.joinable()) transfer.thread.join();
+    }
     if (control_ != nullptr) {
       if (control_->reader.joinable()) control_->reader.join();
       control_.reset();
@@ -369,12 +388,24 @@ void EndpointAgent::session_worker_loop() {
       session_queue_.pop_front();
     }
 
+    // The connection is listed while it is served, so that request_shutdown()
+    // can end a read that is waiting on the peer.
+    std::list<TcpConnection>::iterator listed;
+    {
+      std::lock_guard<std::mutex> lock(movement_workers_mutex_);
+      if (stopping_.load(std::memory_order_acquire)) return;
+      listed = data_connections_.insert(data_connections_.end(), connection);
+    }
     active_sessions_.fetch_add(1, std::memory_order_acq_rel);
     const Status status = serve_data_connection(std::move(connection));
     if (!status.ok() && !stopping_.load(std::memory_order_acquire)) {
       log_message(LogLevel::DEBUG, "endpoint", "data session ended: " + status.to_string());
     }
     active_sessions_.fetch_sub(1, std::memory_order_acq_rel);
+    {
+      std::lock_guard<std::mutex> lock(movement_workers_mutex_);
+      data_connections_.erase(listed);
+    }
   }
 }
 
@@ -845,11 +876,28 @@ Status EndpointAgent::on_execute(const ExecuteMovement& message) {
   }
 
   // The transfer runs on its own thread so the control link keeps answering.
-  std::thread worker([this, movement_id = message.movement_id, attempt = message.attempt,
-                      nonce = Nonce::from_digest(message.nonce)]() {
+  // The agent owns that thread: stop() joins it, and none starts once the
+  // agent is stopping.
+  std::lock_guard<std::mutex> lock(movement_workers_mutex_);
+  if (stopping_.load(std::memory_order_acquire)) {
+    return Status(ReasonCode::SHUTTING_DOWN, "the endpoint is shutting down");
+  }
+  for (auto finished = movement_workers_.begin(); finished != movement_workers_.end();) {
+    if (finished->done.load(std::memory_order_acquire)) {
+      finished->thread.join();
+      finished = movement_workers_.erase(finished);
+    } else {
+      ++finished;
+    }
+  }
+  movement_workers_.emplace_back();
+  MovementWorker& slot = movement_workers_.back();
+  slot.thread = std::thread([this, &slot, movement_id = message.movement_id,
+                             attempt = message.attempt,
+                             nonce = Nonce::from_digest(message.nonce)]() {
     execute_movement_worker(movement_id, attempt, nonce);
+    slot.done.store(true, std::memory_order_release);
   });
-  worker.detach();
   return Status::success();
 }
 
@@ -937,6 +985,27 @@ Status EndpointAgent::run_transfer(const TransferGrant& grant, const TransferAtt
 
   auto connection = TcpConnection::connect(source_address, config_.io_budget_millis);
   if (!connection.ok()) return connection.status();
+
+  // The data connection is listed for as long as this transfer reads it, so
+  // that request_shutdown() can end the read. The listed copy shares the
+  // descriptor with the stream below.
+  struct ListedConnection {
+    EndpointAgent& agent;
+    std::list<TcpConnection>::iterator entry;
+    ~ListedConnection() {
+      std::lock_guard<std::mutex> lock(agent.movement_workers_mutex_);
+      agent.data_connections_.erase(entry);
+    }
+  };
+  std::list<TcpConnection>::iterator listed_entry;
+  {
+    std::lock_guard<std::mutex> lock(movement_workers_mutex_);
+    if (stopping_.load(std::memory_order_acquire)) {
+      return Status(ReasonCode::SHUTTING_DOWN, "the endpoint is shutting down");
+    }
+    listed_entry = data_connections_.insert(data_connections_.end(), connection.value());
+  }
+  const ListedConnection listed{*this, listed_entry};
 
   FrameStream stream(std::move(connection).value(), config_.io_budget_millis,
                      static_cast<std::uint32_t>(config_.policy.max_chunk_bytes + (64U << 10)));

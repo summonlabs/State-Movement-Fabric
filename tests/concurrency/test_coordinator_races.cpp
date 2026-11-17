@@ -12,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <mutex>
 #include <set>
@@ -145,12 +146,19 @@ SMF_TEST(concurrency, idle_clients_do_not_block_shutdown) {
   }
 
   // Shutdown from another thread while the clients are connected but silent.
+  // The clients stay silent for the whole I/O budget, which is three times the
+  // wait below: a stop() that waits their reads out has not returned by then.
+  std::promise<void> stopped;
+  std::future<void> done = stopped.get_future();
   std::thread stopper([&]() {
     const smf::Status status = coordinator->stop();
     (void)status;
+    stopped.set_value();
   });
+  const bool returned = done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
   stopper.join();
 
+  SMF_CHECK(returned);
   SMF_CHECK(coordinator->stopping());
   // A client that tries to use the session now fails rather than hanging.
   smf::PolicyRequest request;
@@ -426,8 +434,9 @@ namespace {
 // and when, is under the proof's control.
 class ScriptedEndpoint {
  public:
-  [[nodiscard]] smf::Status connect(const smf::SocketAddress& address, const smf::Bytes& secret,
-                                    const smf::EndpointId& as) {
+  [[nodiscard]] smf::Status connect(
+      const smf::SocketAddress& address, const smf::Bytes& secret, const smf::EndpointId& as,
+      const smf::SocketAddress& data_address = smf::SocketAddress::parse("127.0.0.1:2").value()) {
     auto connection = smf::TcpConnection::connect(address, 10000);
     if (!connection.ok()) return connection.status();
     stream_ = std::make_unique<smf::FrameStream>(std::move(connection).value(), 10000, 4U << 20);
@@ -469,7 +478,7 @@ class ScriptedEndpoint {
     registration.identity.contract = identity.contract;
     registration.identity.capability_digest = identity.capability_digest;
     registration.service_address = smf::SocketAddress::parse("127.0.0.1:1").value();
-    registration.data_address = smf::SocketAddress::parse("127.0.0.1:2").value();
+    registration.data_address = data_address;
     registration.inventory_digest = smf::sha256(std::string_view("empty-inventory"));
     SMF_RETURN_IF_ERROR(smf::send_message(*stream_, registration));
     const auto ack = smf::receive_message<smf::RegisterAck>(*stream_);
@@ -757,6 +766,102 @@ SMF_TEST(concurrency, a_movement_of_unknown_outcome_is_not_resolved_by_a_cancell
 
   SMF_CHECK_OK(source->stop());
   SMF_CHECK_OK(coordinator->stop());
+}
+
+// Regression: a transfer runs on a thread of the destination agent and works on
+// that agent, so stop() has to end it and wait for it. The source here is
+// scripted and its data listener accepts the destination's data session without
+// ever answering, which leaves the transfer blocked in a read when the
+// destination is stopped.
+SMF_TEST(concurrency, stopping_a_destination_ends_its_running_transfer) {
+  smftest::TempDir dir("conc-stop-transfer");
+  auto started = smf::Coordinator::start(coordinator_config(dir.path() / "state"));
+  SMF_CHECK_OK(started);
+  if (!started.ok()) return;
+  std::unique_ptr<smf::Coordinator> coordinator = std::move(started).value();
+
+  auto listening = smf::TcpListener::bind(smf::SocketAddress::parse("127.0.0.1:0").value());
+  SMF_CHECK_OK(listening);
+  if (!listening.ok()) return;
+  smf::TcpListener silent_data_listener = std::move(listening).value();
+
+  ScriptedEndpoint source;
+  const smf::EndpointId source_id = smf::EndpointId::parse("stop-source").value();
+  SMF_CHECK_OK(source.connect(coordinator->endpoint_address(), test_secret(), source_id,
+                              silent_data_listener.address()));
+  const smf::StateObjectDescriptor object =
+      smftest::make_descriptor(smf::StateKind::KV, "race/stop-transfer", 1, 64U << 10, 16U << 10);
+  smf::AnnounceObject announce;
+  announce.descriptor = object;
+  SMF_CHECK_OK(source.send(announce));
+  for (;;) {
+    const auto frame = source.receive();
+    SMF_REQUIRE(frame.ok());
+    if (frame.value().header.type == smf::MessageType::ANNOUNCE_ACK) break;
+  }
+
+  auto destination_started = smf::EndpointAgent::start(
+      agent_config(*coordinator, "stop-destination", dir.path() / "destination"));
+  SMF_CHECK_OK(destination_started);
+  if (!destination_started.ok()) return;
+  std::unique_ptr<smf::EndpointAgent> destination = std::move(destination_started).value();
+  SMF_CHECK_OK(destination->connect_to_coordinator());
+
+  // A failed check leaves the proof by exception. Whatever happens, the
+  // coordinator is stopped first, which ends the source's session, and the
+  // responder is joined.
+  std::thread responder;
+  struct Teardown {
+    smf::Coordinator& coordinator;
+    std::thread& thread;
+    ~Teardown() {
+      const smf::Status stopped = coordinator.stop();
+      (void)stopped;
+      if (thread.joinable()) thread.join();
+    }
+  } teardown{*coordinator, responder};
+
+  responder = std::thread([&]() {
+    for (;;) {
+      const auto frame = source.receive();
+      if (!frame.ok()) return;
+      if (frame.value().header.type != smf::MessageType::GRANT_TRANSFER) continue;
+      const auto message = smf::decode_message<smf::GrantTransfer>(frame.value());
+      if (!message.ok()) return;
+      smf::GrantAck ack;
+      ack.nonce = smf::Digest(message.value().grant.grant_nonce.bytes());
+      ack.code = ReasonCode::OK;
+      ack.detail = "grant accepted";
+      if (!source.send(ack).ok()) return;
+    }
+  });
+
+  smf::SubmitMovement request;
+  request.object_id = object.object_id;
+  request.object_generation = object.generation;
+  request.source = source_id;
+  request.destination = destination->endpoint_id();
+  const auto accepted = coordinator->submit(request);
+  SMF_CHECK_OK(accepted);
+  if (!accepted.ok()) return;
+
+  // The destination opens its data session and waits for an answer.
+  auto data = silent_data_listener.accept(30000);
+  SMF_CHECK_OK(data);
+  if (!data.ok()) return;
+
+  SMF_CHECK_OK(destination->stop());
+
+  // The transfer has ended by the time stop() returns, so its end of the data
+  // session is closed: what is left to read ends in a close, not in a wait.
+  bool closed = false;
+  smf::Bytes buffer(4096);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!closed && std::chrono::steady_clock::now() < deadline) {
+    const auto got = data.value().receive_some(smf::ByteSpan(buffer), 250);
+    closed = got.ok() ? got.value() == 0 : got.status().code() != ReasonCode::IO_TIMEOUT;
+  }
+  SMF_CHECK(closed);
 }
 
 SMF_TEST(concurrency, an_ended_session_does_not_take_down_its_successors_registration) {

@@ -15,6 +15,7 @@
 #include <deque>
 #include <filesystem>
 #include <future>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -181,6 +182,19 @@ class EndpointAgent {
 
   std::thread accept_thread_;
   std::vector<std::thread> session_workers_;
+
+  // Transfer threads started by on_execute(), and every data connection a
+  // transfer or an inbound data session is reading. request_shutdown() shuts
+  // those connections down and stop() joins the threads, so no transfer
+  // outlives the agent it works on and no read is left to run out its budget.
+  struct MovementWorker {
+    std::thread thread;
+    std::atomic<bool> done{false};
+  };
+  std::mutex movement_workers_mutex_;
+  std::list<MovementWorker> movement_workers_;
+  std::list<TcpConnection> data_connections_;
+
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::deque<TcpConnection> session_queue_;

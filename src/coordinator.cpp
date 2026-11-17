@@ -251,6 +251,28 @@ void Coordinator::accept_loop(bool admin) {
 }
 
 Status Coordinator::session_loop(TcpConnection connection, bool admin) {
+  // The connection is listed for as long as the session is served. Only
+  // registered endpoints have a link that request_shutdown() can reach; an
+  // operator session, or one that has not registered, is reached through this
+  // list. The listed copy shares the descriptor with the stream below.
+  struct ListedConnection {
+    Coordinator& coordinator;
+    std::list<TcpConnection>::iterator entry;
+    ~ListedConnection() {
+      std::lock_guard<std::mutex> lock(coordinator.sessions_mutex_);
+      coordinator.session_connections_.erase(entry);
+    }
+  };
+  std::list<TcpConnection>::iterator listed_entry;
+  {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    if (stopping_.load(std::memory_order_acquire)) {
+      return Status(ReasonCode::SHUTTING_DOWN, "the coordinator is shutting down");
+    }
+    listed_entry = session_connections_.insert(session_connections_.end(), connection);
+  }
+  const ListedConnection listed{*this, listed_entry};
+
   FrameStream stream(std::move(connection), config_.io_budget_millis,
                      static_cast<std::uint32_t>(config_.policy.max_chunk_bytes + (64U << 10)));
 
@@ -1700,6 +1722,15 @@ Status Coordinator::request_shutdown() {
         const Status status = entry.second->stream.shutdown();
         (void)status;
       }
+    }
+  }
+  {
+    // Sessions without a registered link are read with the same budget. End
+    // those reads too rather than leave stop() to wait the budget out.
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    for (TcpConnection& connection : session_connections_) {
+      const Status status = connection.shutdown();
+      (void)status;
     }
   }
   queue_cv_.notify_all();
